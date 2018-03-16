@@ -11,7 +11,7 @@ from subprocess import check_call
 def download_legi(tar_dir):
     check_call([
         'wget', '-c', '-N', '--no-remove-listing', '-nH', '-P', tar_dir,
-        'ftp://legi:open1234@ftp2.journal-officiel.gouv.fr/*legi_*'
+        'ftp://constit:open1234@ftp2.journal-officiel.gouv.fr/*constit_*'
     ])
 
 

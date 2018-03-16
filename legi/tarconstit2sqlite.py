@@ -1,0 +1,406 @@
+"""
+Extracts CONSTIT tar archives into an SQLite DB
+"""
+
+from __future__ import division, print_function, unicode_literals
+
+from argparse import ArgumentParser
+import fnmatch
+import json
+import os
+import re
+
+import libarchive
+from lxml import etree
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    print('[warning] tqdm is not installed, the progress bar is disabled')
+    tqdm = lambda x: x
+
+from .anomalies import detect_anomalies
+from .utils import connect_db
+
+
+def count(d, k, c):
+    if c == 0:
+        return
+    try:
+        d[k] += c
+    except KeyError:
+        d[k] = c
+
+
+def innerHTML(e):
+    i = len(e.tag) + 2
+    return etree.tostring(e, encoding='unicode', with_tail=False)[i:-i-1]
+
+
+def scrape_tags(attrs, root, wanted_tags, unwrap=False):
+    attrs.update(
+        (e.tag.lower(), (innerHTML(e[0]) if unwrap else innerHTML(e)) or None)
+        for e in root if e.tag in wanted_tags
+    )
+
+
+def suppress(get_table, db, liste_suppression):
+    counts = {}
+    for path in liste_suppression:
+        parts = path.split('/')
+        assert parts[0] == 'constit'
+        text_cid = parts[11]
+        text_id = parts[-1]
+        assert len(text_id) == 20
+        table = get_table(parts)
+        db.run("""
+            DELETE FROM {0}
+             WHERE dossier = ?
+               AND cid = ?
+               AND id = ?
+        """.format(table), (parts[3], text_cid, text_id))
+        changes = db.changes()
+        if changes:
+            count(counts, 'delete from ' + table, changes)
+            # Also delete derivative data
+            if table in ('articles', 'textes_versions'):
+                db.run("""
+                    DELETE FROM liens
+                     WHERE src_id = ? AND NOT _reversed
+                        OR dst_id = ? AND _reversed
+                """, (text_id, text_id))
+                count(counts, 'delete from liens', db.changes())
+            elif table == 'sections':
+                db.run("""
+                    DELETE FROM sommaires
+                     WHERE cid = ?
+                       AND parent = ?
+                       AND _source = 'section_ta_liens'
+                """, (text_cid, text_id))
+                count(counts, 'delete from sommaires', db.changes())
+            elif table == 'textes_structs':
+                db.run("""
+                    DELETE FROM sommaires
+                     WHERE cid = ?
+                       AND _source = 'struct/' || ?
+                """, (text_cid, text_id))
+                count(counts, 'delete from sommaires', db.changes())
+            # And delete the associated row in textes_versions_brutes if it exists
+            if table == 'textes_versions':
+                db.run("DELETE FROM textes_versions_brutes WHERE id = ?", (text_id,))
+                count(counts, 'delete from textes_versions_brutes', db.changes())
+            # If the file had an older duplicate that hasn't been deleted then
+            # we have to fall back to that, otherwise we'd be missing data
+            older_file = db.one("""
+                SELECT *
+                  FROM duplicate_files
+                 WHERE id = ?
+              ORDER BY mtime DESC
+                 LIMIT 1
+            """, (text_id,), to_dict=True)
+            if older_file:
+                db.run("""
+                    DELETE FROM duplicate_files
+                     WHERE dossier = ?
+                       AND cid = ?
+                       AND id = ?
+                """, (older_file['dossier'], older_file['cid'], older_file['id']))
+                count(counts, 'delete from duplicate_files', db.changes())
+                for table, rows in json.loads(older_file['data']).items():
+                    if isinstance(rows, dict):
+                        rows['id'] = older_file['id']
+                        rows['cid'] = older_file['cid']
+                        rows['dossier'] = older_file['dossier']
+                        rows['mtime'] = older_file['mtime']
+                        rows = (rows,)
+                    for row in rows:
+                        db.insert(table, row)
+                    count(counts, 'insert into ' + table, len(rows))
+        else:
+            # Remove the file from the duplicates table if it was in there
+            db.run("""
+                DELETE FROM duplicate_files
+                 WHERE dossier = ?
+                   AND cid = ?
+                   AND id = ?
+            """, (parts[3], text_cid, text_id))
+            count(counts, 'delete from duplicate_files', db.changes())
+    total = sum(counts.values())
+    print("made", total, "changes in the database based on liste_suppression_constit.dat:",
+          json.dumps(counts, indent=4, sort_keys=True))
+
+
+def process_archive(db, archive_path):
+
+    # Define some constants
+    ARTICLE_TAGS = set('NOTA BLOC_TEXTUEL'.split())
+    SECTION_TA_TAGS = set('TITRE_TA COMMENTAIRE'.split())
+    TEXTELR_TAGS = set('VERSIONS'.split())
+    TEXTE_VERSION_TAGS = set('VISAS SIGNATAIRES TP NOTA ABRO RECT'.split())
+    TEXTE_JURI_CONSTIT_TAGS = set( 'SAISINES OBSERVATIONS'.split() )
+    META_ARTICLE_TAGS = set('NUM ETAT DATE_DEBUT DATE_FIN TYPE'.split())
+    META_CHRONICLE_TAGS = set("""
+        NUM NUM_SEQUENCE NOR DATE_PUBLI DATE_TEXTE DERNIERE_MODIFICATION
+        ORIGINE_PUBLI PAGE_DEB_PUBLI PAGE_FIN_PUBLI
+    """.split())
+    META_VERSION_TAGS = set(
+        'TITRE TITREFULL ETAT DATE_DEBUT DATE_FIN AUTORITE MINISTERE'.split()
+    )
+    META_JURI_TAGS = set(
+        'TITRE DATE_DEC JURIDICTION NUMERO SOLUTION'.split()
+    )
+    META_JURI_CONSTIT_TAGS = set(
+        'NOR NATURE_QUALIFIEE LOI_DEF TITRE_JO URL_CC ECLI'.split()
+    )
+    SOUS_DOSSIER_MAP = {
+        'articles': 'article',
+        'sections': 'section_ta',
+        'textes_structs': 'texte/struct',
+        'textes_versions': '.',
+    }
+    TABLES_MAP = {'ARTI': 'articles', 'SCTA': 'sections', 'TEXT': 'textes_'}
+    TYPELIEN_MAP = {
+        "ABROGATION": "ABROGE",
+        "ANNULATION": "ANNULE",
+        "CODIFICATION": "CODIFIE",
+        "CONCORDANCE": "CONCORDE",
+        "CREATION": "CREE",
+        "DEPLACE": "DEPLACEMENT",
+        "DISJOINT": "DISJONCTION",
+        "MODIFICATION": "MODIFIE",
+        "PEREMPTION": "PERIME",
+        "RATIFICATION": "RATIFIE",
+        "TRANSFERE": "TRANSFERT",
+    }
+    TYPELIEN_MAP.update([(v, k) for k, v in TYPELIEN_MAP.items()])
+
+    # Define some shortcuts
+    attr = etree._Element.get
+    insert = db.insert
+    update = db.update
+
+    def get_table(parts):
+        table = TABLES_MAP[parts[-1][4:8]]
+        if table == 'textes_':
+            table += 'versions'
+        return table
+
+    counts = {}
+    def count_one(k):
+        try:
+            counts[k] += 1
+        except KeyError:
+            counts[k] = 1
+
+    skipped = 0
+    liste_suppression = []
+    xml = etree.XMLParser(remove_blank_text=True)
+    with libarchive.file_reader(archive_path) as archive:
+        for entry in tqdm(archive):
+            path = entry.pathname
+            if path[-1] == '/':
+                continue
+            parts = path.split('/')
+            if parts[-1] == 'liste_suppression_constit.dat':
+                liste_suppression += b''.join(entry.get_blocks()).decode('ascii').split()
+                continue
+            if parts[1] == 'constit':
+                path = path[len(parts[0])+1:]
+                parts = parts[1:]
+            dossier = parts[3]
+            text_cid = parts[9]
+            text_id = parts[-1][:-4]
+            mtime = entry.mtime
+
+            # Skip the file if it hasn't changed, store it if it's a duplicate
+            duplicate = False
+            table = get_table(parts)
+            prev_row = db.one("""
+                SELECT mtime, dossier, cid
+                  FROM {0}
+                 WHERE id = ?
+            """.format(table), (text_id,))
+            if prev_row:
+                prev_mtime, prev_dossier, prev_cid = prev_row
+                if prev_dossier != dossier or prev_cid != text_cid:
+                    if prev_mtime >= mtime:
+                        duplicate = True
+                    else:
+                        prev_row_dict = db.one("""
+                            SELECT *
+                              FROM {0}
+                             WHERE id = ?
+                        """.format(table), (text_id,), to_dict=True)
+                        count_one('upsert into duplicate_files')
+                elif prev_mtime == mtime:
+                    skipped += 1
+                    continue
+
+            xml.feed(b''.join(entry.get_blocks()))
+            root = xml.close()
+            tag = root.tag
+            meta = root.find('META')
+
+            # Check the ID
+            if tag == 'SECTION_TA':
+                assert root.find('ID').text == text_id
+            else:
+                meta_commun = meta.find('META_COMMUN')
+                assert meta_commun.find('ID').text == text_id
+                nature = meta_commun.find('NATURE').text
+
+            # Extract the data we want
+            attrs = {}
+            liens = ()
+            sommaires = ()
+            if tag == 'ARTICLE':
+                assert nature == 'Article'
+                assert table == 'articles'
+                contexte = root.find('CONTEXTE/TEXTE')
+                assert attr(contexte, 'cid') == text_cid
+                sections = contexte.findall('.//TITRE_TM')
+                if sections:
+                    attrs['section'] = attr(sections[-1], 'id')
+                meta_article = meta.find('META_SPEC/META_ARTICLE')
+                scrape_tags(attrs, meta_article, META_ARTICLE_TAGS)
+                scrape_tags(attrs, root, ARTICLE_TAGS, unwrap=True)
+            elif tag == 'SECTION_TA':
+                assert table == 'sections'
+                scrape_tags(attrs, root, SECTION_TA_TAGS)
+                section_id = text_id
+                contexte = root.find('CONTEXTE/TEXTE')
+                assert attr(contexte, 'cid') == text_cid
+                parents = contexte.findall('.//TITRE_TM')
+                if parents:
+                    attrs['parent'] = attr(parents[-1], 'id')
+                sommaires = [
+                    {
+                        'cid': text_cid,
+                        'parent': section_id,
+                        'element': attr(lien, 'id'),
+                        'debut': attr(lien, 'debut'),
+                        'fin': attr(lien, 'fin'),
+                        'etat': attr(lien, 'etat'),
+                        'num': attr(lien, 'num'),
+                        'position': i,
+                        '_source': 'section_ta_liens',
+                    }
+                    for i, lien in enumerate(root.find('STRUCTURE_TA'))
+                ]
+            elif tag == 'TEXTELR':
+                assert table == 'textes_structs'
+                scrape_tags(attrs, root, TEXTELR_TAGS)
+                sommaires = [
+                    {
+                        'cid': text_cid,
+                        'element': attr(lien, 'id'),
+                        'debut': attr(lien, 'debut'),
+                        'fin': attr(lien, 'fin'),
+                        'etat': attr(lien, 'etat'),
+                        'position': i,
+                        '_source': 'struct/' + text_id,
+                    }
+                    for i, lien in enumerate(root.find('STRUCT'))
+                ]
+            elif tag == 'TEXTE_JURI_CONSTIT':
+                assert table == 'textes_versions'
+                attrs['nature'] = nature
+                meta_spec = meta.find('META_SPEC')
+                meta_juri = meta_spec.find('META_JURI')
+                scrape_tags(attrs, meta_juri, META_JURI_TAGS)
+                meta_version = meta_spec.find('META_JURI_CONSTIT')
+                scrape_tags(attrs, meta_version, META_JURI_CONSTIT_TAGS)
+                scrape_tags(attrs, root, TEXTE_JURI_CONSTIT_TAGS, unwrap=True)
+            else:
+                raise Exception('unexpected tag: '+tag)
+
+            attrs['dossier'] = dossier
+            attrs['cid'] = text_cid
+            attrs['mtime'] = mtime
+
+            if prev_row:
+                if table == 'textes_versions':
+                    db.run("DELETE FROM textes_versions_brutes WHERE id = ?", (text_id,))
+                    count(counts, 'delete from textes_versions_brutes', db.changes())
+                # Update the row
+                count_one('update in '+table)
+                update(table, dict(id=text_id), attrs)
+            else:
+                count_one('insert into '+table)
+                attrs['id'] = text_id
+		print(table)
+		print(attrs)
+                insert(table, attrs)
+
+    print("made", sum(counts.values()), "changes in the database:",
+          json.dumps(counts, indent=4, sort_keys=True))
+
+    if skipped:
+        print("skipped", skipped, "files that haven't changed")
+
+    if liste_suppression:
+        suppress(get_table, db, liste_suppression)
+
+
+def main():
+    p = ArgumentParser()
+    p.add_argument('db')
+    p.add_argument('directory')
+    p.add_argument('--anomalies', action='store_true', default=False,
+                   help="detect anomalies after each processed archive")
+    p.add_argument('--anomalies-dir', default='.')
+    p.add_argument('--raw', default=False, action='store_true')
+    args = p.parse_args()
+
+    if not os.path.isdir(args.anomalies_dir):
+        os.mkdir(args.anomalies_dir)
+
+    db = connect_db(args.db)
+
+    # Look for new archives in the given directory
+    last_update = db.one("SELECT value FROM db_meta WHERE key = 'last_update'")
+    print("> last_update is", last_update)
+    archive_re = re.compile(r'(.+_)?constit(?P<global>_global)?_(?P<date>[0-9]{8}-[0-9]{6})\..+')
+    skipped = 0
+    files = sorted(os.listdir(args.directory))
+    for archive_name in fnmatch.filter(files, '*constit_*.tar.*'):
+        m = archive_re.match(archive_name)
+        if not m:
+            print("unable to extract date from archive filename", archive_name)
+            continue
+        is_delta = not m.group('global')
+        if bool(last_update) ^ is_delta:
+            skipped += 1
+            continue
+        archive_date = m.group('date')
+        if last_update and archive_date <= last_update:
+            skipped += 1
+            continue
+
+        # Okay, process this one
+        if skipped:
+            print("> Skipped %i old archives" % skipped)
+            skipped = 0
+        print("> Processing %s..." % archive_name)
+        with db:
+            process_archive(db, args.directory + '/' + archive_name)
+            if last_update:
+                db.run("UPDATE db_meta SET value = ? WHERE key = 'last_update'", (archive_date,))
+            else:
+                db.run("INSERT INTO db_meta VALUES ('last_update', ?)", (archive_date,))
+        last_update = archive_date
+        print('last_update is now set to', last_update)
+
+        # Detect anomalies if requested
+        if args.anomalies:
+            fpath = args.anomalies_dir + '/anomalies-' + last_update + '.txt'
+            with open(fpath, 'w') as f:
+                n_anomalies = detect_anomalies(db, f)
+            print("logged", n_anomalies, "anomalies in", fpath)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
