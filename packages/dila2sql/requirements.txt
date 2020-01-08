@@ -4,7 +4,7 @@ tqdm
 aiohttp
 aiofiles
 backoff
-peewee
+peewee>=3.5.2
 psycopg2-binary
 tox
 xlrd
